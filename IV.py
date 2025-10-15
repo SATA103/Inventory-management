@@ -7,7 +7,7 @@ DB_PATH = r"\\bioblrnas\msat\inventory.db"  # Network shared DB
 
 # ---- Page Config ----
 st.set_page_config(page_title="Inventory Management", layout="wide")
-st.title("📦 Inventory Management (Shared Network Database)")
+st.title("📦 Inventory Management")
 
 # ---- Database Connection ----
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
