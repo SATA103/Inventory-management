@@ -1,88 +1,122 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import os
+import threading
+from datetime import datetime
 
-# ---- Shared Database Path ----
+# ==========================================================
+# ---- CONFIGURATION ----
+# ==========================================================
 DB_PATH = r"\\bioblrnas\msat\inventory.db"
 
-# ---- Page Config ----
 st.set_page_config(page_title="Inventory Management", layout="wide")
-st.title("📦 Inventory Management (Shared Network Database)")
+st.title("📦 Inventory Management")
 
-# ---- Database Connection ----
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-c = conn.cursor()
+# ---- Show DB details in sidebar ----
+st.sidebar.write("### 🗂️ Database Info")
+st.sidebar.write(f"📁 **Path:** `{DB_PATH}`")
+st.sidebar.write(f"✅ Exists: {os.path.exists(DB_PATH)}")
 
-# ---- Table Creation ----
-c.execute('''
-CREATE TABLE IF NOT EXISTS inventory (
-    item_id TEXT PRIMARY KEY,
-    item_name TEXT,
-    category TEXT,
-    quantity REAL,
-    price REAL
-)
-''')
-conn.commit()
+if os.path.exists(DB_PATH):
+    mtime = datetime.fromtimestamp(os.path.getmtime(DB_PATH)).strftime("%Y-%m-%d %H:%M:%S")
+    st.sidebar.write(f"🕒 **Last Modified:** {mtime}")
+else:
+    st.sidebar.warning("⚠️ Database not found — will be created automatically.")
 
-# ---- Add missing columns safely ----
-def add_missing_column(table, column, col_type, default_value=None):
-    c.execute(f"PRAGMA table_info({table})")
-    columns = [col[1] for col in c.fetchall()]
-    if column not in columns:
-        query = f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
-        if default_value is not None:
-            query += f" DEFAULT {default_value}"
-        c.execute(query)
+# ==========================================================
+# ---- DATABASE HANDLING ----
+# ==========================================================
+lock = threading.Lock()  # ensures thread-safe writes
+
+def get_connection():
+    return sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
+
+def init_db():
+    with lock:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS inventory (
+            item_id TEXT PRIMARY KEY,
+            item_name TEXT,
+            category TEXT,
+            quantity REAL,
+            uom TEXT,
+            price REAL,
+            currency TEXT DEFAULT 'USD',
+            reorder_level REAL DEFAULT 70.0,
+            reorder_triggered INTEGER DEFAULT 0
+        )
+        ''')
         conn.commit()
-
-add_missing_column("inventory", "uom", "TEXT", "'pcs'")
-add_missing_column("inventory", "reorder_level", "REAL", 70.0)
-add_missing_column("inventory", "reorder_triggered", "INTEGER", 0)
-add_missing_column("inventory", "currency", "TEXT", "'USD'")
-
-# ---- Helper Functions ----
-def get_inventory():
-    return pd.read_sql("SELECT * FROM inventory", conn)
+        conn.close()
 
 def add_or_update_item(item_id, item_name, category, quantity, uom, price, currency, reorder_level):
-    c.execute("SELECT * FROM inventory WHERE item_id=?", (item_id,))
-    if c.fetchone():
-        c.execute("""
-        UPDATE inventory
-        SET item_name=?, category=?, quantity=?, uom=?, price=?, currency=?, reorder_triggered=0, reorder_level=?
-        WHERE item_id=?
-        """, (item_name, category, quantity, uom, price, currency, reorder_level, item_id))
-    else:
-        c.execute("""
-        INSERT INTO inventory (item_id, item_name, category, quantity, uom, price, currency, reorder_level)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (item_id, item_name, category, quantity, uom, price, currency, reorder_level))
-    conn.commit()
+    with lock:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT * FROM inventory WHERE item_id=?", (item_id,))
+        if c.fetchone():
+            c.execute("""
+                UPDATE inventory
+                SET item_name=?, category=?, quantity=?, uom=?, price=?, currency=?, reorder_level=?, reorder_triggered=0
+                WHERE item_id=?
+            """, (item_name, category, quantity, uom, price, currency, reorder_level, item_id))
+        else:
+            c.execute("""
+                INSERT INTO inventory (item_id, item_name, category, quantity, uom, price, currency, reorder_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (item_id, item_name, category, quantity, uom, price, currency, reorder_level))
+        conn.commit()
+        conn.close()
+
+def get_inventory():
+    conn = get_connection()
+    df = pd.read_sql("SELECT * FROM inventory", conn)
+    conn.close()
+    return df
 
 def update_stock(item_id, change):
-    c.execute("UPDATE inventory SET quantity = quantity + ? WHERE item_id = ?", (change, item_id))
-    conn.commit()
+    with lock:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("UPDATE inventory SET quantity = quantity + ? WHERE item_id = ?", (change, item_id))
+        conn.commit()
+        conn.close()
 
 def delete_item(item_id):
-    c.execute("DELETE FROM inventory WHERE item_id=?", (item_id,))
-    conn.commit()
+    with lock:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM inventory WHERE item_id=?", (item_id,))
+        conn.commit()
+        conn.close()
 
 def mark_ordered(item_id):
-    c.execute("UPDATE inventory SET reorder_triggered = 1 WHERE item_id = ?", (item_id,))
-    conn.commit()
+    with lock:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("UPDATE inventory SET reorder_triggered = 1 WHERE item_id=?", (item_id,))
+        conn.commit()
+        conn.close()
 
-# ---- Highlight Low-Stock ----
 def highlight_low_stock(row):
     if row['quantity'] < row['reorder_level']:
         return ['background-color: #FF9999'] * len(row)
-    else:
-        return [''] * len(row)
+    return [''] * len(row)
 
-# ---- Tabs ----
+# Initialize DB once
+init_db()
+
+# ==========================================================
+# ---- TABS ----
+# ==========================================================
 tab1, tab2, tab3 = st.tabs(["Inventory Overview", "Add / Update Item", "Stock Management"])
 
-# ---- Tab 1: Overview ----
+# ==========================================================
+# ---- TAB 1: OVERVIEW ----
+# ==========================================================
 with tab1:
     st.subheader("📊 Current Inventory")
 
@@ -96,58 +130,46 @@ with tab1:
         df = df[df['item_name'].str.contains(search_term, case=False) |
                 df['category'].str.contains(search_term, case=False)]
 
-    # Low-stock notification
+    # Low-stock warning
     low_stock = df[df['quantity'] < df['reorder_level']]
     if not low_stock.empty:
         st.warning(
             "⚠️ Low Stock Alert:\n" +
             "\n".join([
-                f"{row['item_name']} ({row['quantity']} {row['uom']}, threshold {row['reorder_level']})"
+                f"{row['item_name']} ({row['quantity']} {row['uom']} — threshold {row['reorder_level']})"
                 for _, row in low_stock.iterrows()
             ])
         )
 
-    # Rearrange columns: UOM after quantity
     if not df.empty:
-        cols = df.columns.tolist()
-        if 'uom' in cols and 'quantity' in cols:
-            cols.remove('uom')
-            qty_index = cols.index('quantity')
-            cols.insert(qty_index + 1, 'uom')
-            df = df[cols]
-
-        # Show currency inline
         df['price'] = df.apply(lambda x: f"{x['currency']} {x['price']:.2f}", axis=1)
-        st.dataframe(df.style.apply(highlight_low_stock, axis=1))
+        st.dataframe(df.style.apply(highlight_low_stock, axis=1), use_container_width=True)
     else:
         st.info("No items in inventory yet.")
 
-    # Summary stats
-    # ---- Summary stats ----
+    # Summary statistics
     st.subheader("📈 Summary Statistics")
-    
     total_items = len(df)
     total_qty = df["quantity"].sum() if not df.empty else 0
-    
-    # Safely convert price to numeric if any text slipped in
     try:
-        df["numeric_price"] = pd.to_numeric(df["price"].replace({',': ''}, regex=True), errors='coerce')
+        df["numeric_price"] = pd.to_numeric(df["price"].str.replace("[^0-9.]", "", regex=True), errors="coerce")
         total_value = (df["quantity"] * df["numeric_price"]).sum()
     except Exception:
         total_value = 0
-    
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Items", total_items)
     c2.metric("Total Quantity", total_qty)
     c3.metric("Total Inventory Value", f"{total_value:,.2f}" if total_value else "N/A")
 
-
-    # Export
+    # Export option
     if not df.empty:
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Export to CSV", csv, "inventory_export.csv", "text/csv")
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Export Inventory to CSV", csv, "inventory_export.csv", "text/csv")
 
-# ---- Tab 2: Add / Update ----
+# ==========================================================
+# ---- TAB 2: ADD / UPDATE ITEM ----
+# ==========================================================
 with tab2:
     st.subheader("➕ Add or Update Item")
 
@@ -157,17 +179,20 @@ with tab2:
     quantity = st.number_input("Quantity", min_value=0.0, step=1.0)
     uom = st.text_input("Unit of Measurement (e.g., pcs, kg)")
     price = st.number_input("Price per Unit", min_value=0.0, step=0.01)
-    currency = st.selectbox("Currency", ["USD", "EUR", "GBP", "INR"])
+    currency = st.selectbox("Currency", ["USD", "EUR", "GBP", "INR"], index=3)
     reorder_level = st.number_input("Reorder Threshold", min_value=0.0, step=1.0, value=70.0)
 
     if st.button("💾 Save Item"):
         if item_id and item_name and uom:
             add_or_update_item(item_id, item_name, category, quantity, uom, price, currency, reorder_level)
             st.success(f"✅ Item '{item_name}' added/updated successfully!")
+            st.rerun()
         else:
             st.warning("⚠️ Item ID, Name, and UOM are required.")
 
-# ---- Tab 3: Stock Management ----
+# ==========================================================
+# ---- TAB 3: STOCK MANAGEMENT ----
+# ==========================================================
 with tab3:
     st.subheader("📦 Manage Stock")
     df = get_inventory()
@@ -183,17 +208,19 @@ with tab3:
         st.write(f"**Reorder Triggered:** {'Yes' if item_row['reorder_triggered'] else 'No'}")
 
         stock_change = st.number_input("Change Quantity (+/-)", value=0.0, step=1.0)
-        if st.button("Update Stock"):
-            update_stock(selected_id, stock_change)
-            st.success("✅ Stock updated successfully!")
-            st.rerun()
-
-        if st.button("Mark as Ordered"):
-            mark_ordered(selected_id)
-            st.success("✅ Marked as ordered — low-stock notification stopped.")
-            st.rerun()
-
-        if st.button("❌ Delete Item"):
-            delete_item(selected_id)
-            st.success(f"Item '{item_row['item_name']}' deleted from inventory!")
-            st.rerun()
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("📈 Update Stock"):
+                update_stock(selected_id, stock_change)
+                st.success("✅ Stock updated successfully!")
+                st.rerun()
+        with col2:
+            if st.button("🛒 Mark as Ordered"):
+                mark_ordered(selected_id)
+                st.success("✅ Marked as ordered — low-stock notification stopped.")
+                st.rerun()
+        with col3:
+            if st.button("❌ Delete Item"):
+                delete_item(selected_id)
+                st.success(f"Item '{item_row['item_name']}' deleted from inventory!")
+                st.rerun()
